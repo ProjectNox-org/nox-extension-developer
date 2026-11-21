@@ -10,14 +10,14 @@ import json
 import os
 from pathlib import Path
 import re
+import secrets
 import shutil
+import signal
 import subprocess
 import tempfile
 import threading
 from typing import Any, Sequence
 from urllib.parse import parse_qs, quote, urlsplit, urlunsplit
-import urllib.error
-import urllib.request
 
 from nox_core import (
     atomic_write_text,
@@ -27,6 +27,7 @@ from nox_core import (
     is_safe_public_url,
     make_receipt,
     resolve_relative_url,
+    safe_http_fetch,
 )
 from nox_env import (
     check_identity_continuity,
@@ -646,8 +647,10 @@ class _FixtureHandler(BaseHTTPRequestHandler):
 
 
 def _http_get(url: str) -> tuple[int, str, bytes]:
-    with urllib.request.urlopen(url, timeout=5) as resp:
-        return resp.status, resp.headers.get('Content-Type', ''), resp.read()
+    st, ctype, raw, err = _safe_http_fetch(url, allow_local_fixture=True, timeout=5)
+    if err and st == 0:
+        raise RuntimeError(err)
+    return st, ctype, raw
 
 
 def run_functional_scenarios(work_dir: Path | None = None) -> dict[str, Any]:
@@ -894,30 +897,14 @@ def _safe_http_fetch(
     timeout: int = 8,
     headers: dict[str, str] | None = None,
 ) -> tuple[int, str, bytes, str | None]:
-    """Safely fetch HTTP/HTTPS bytes validating against SSRF and metadata endpoints."""
-    parsed = urlsplit(url.strip())
-    scheme = parsed.scheme.lower()
-    if scheme not in {'http', 'https'} or not parsed.hostname:
-        return 0, '', b'', f'unsafe URL: {url}'
-    is_loopback = _is_loopback_host(url)
-    if is_loopback and not allow_local_fixture:
-        return 0, '', b'', f'local host requires explicit allow_local_fixture: {parsed.hostname}'
-    safe_pub, reason = is_safe_public_url(url, allow_private_fixture=is_loopback and allow_local_fixture)
-    if not safe_pub:
-        return 0, '', b'', reason
-
-    clean_url = urlunsplit((scheme, parsed.netloc, parsed.path or '/', parsed.query, ''))
+    """Safely fetch HTTP/HTTPS bytes validating against SSRF, DNS rebinding, and metadata endpoints."""
     req_headers = {'User-Agent': 'nox-extension-developer/2.1', **(headers or {})}
-    req = urllib.request.Request(clean_url, headers=req_headers)
-    try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return int(resp.status), resp.headers.get('Content-Type', ''), resp.read(2_000_000), None
-    except urllib.error.HTTPError as exc:
-        code = int(exc.code)
-        exc.close()
-        return code, '', b'', f'HTTP {code}'
-    except (urllib.error.URLError, OSError, TimeoutError, ValueError) as exc:
-        return 0, '', b'', str(exc)
+    return safe_http_fetch(
+        url,
+        allow_local_fixture=allow_local_fixture,
+        timeout=timeout,
+        headers=req_headers,
+    )
 
 
 def _pick_class_selector(anchors: list[dict[str, Any]], candidates: Sequence[str]) -> tuple[str | None, list[dict[str, Any]]]:
@@ -1448,31 +1435,113 @@ def _execute_lnreader_ts_in_node(
     *,
     allow_local_fixture: bool = False,
     timeout: int = 20,
+    sandbox_available_override: bool | None = None,
 ) -> dict[str, Any]:
-    """Execute a real LNReader TypeScript plugin via Node.js against target HTTP endpoints."""
-    node_bin = shutil.which('node')
-    if not node_bin:
-        return {'status': 'BLOCKED', 'executed': False, 'reason': 'node_binary_not_found'}
+    """Execute an LNReader TypeScript plugin strictly inside Bubblewrap (--unshare-all, --unshare-net, --clearenv)."""
+    import nox_android
 
     parsed_base = urlsplit(base_url.strip())
-    is_loop = _is_loopback_host(base_url)
-    ok_pub, reason = is_safe_public_url(base_url, allow_private_fixture=is_loop and allow_local_fixture)
-    if not ok_pub or (is_loop and not allow_local_fixture):
-        return {'status': 'FAIL', 'executed': False, 'reason': f'blocked_target_url:{reason}'}
+    ok_pub, reason = is_safe_public_url(base_url, allow_private_fixture=allow_local_fixture, resolve_dns=False)
+    if not ok_pub:
+        return {
+            'status': 'FAIL',
+            'executed': False,
+            'executed_unprotected': False,
+            'reason': f'blocked_target_url:{reason}',
+            'failures': ['blocked_target_url'],
+        }
 
-    allowed_origin = f'{parsed_base.scheme.lower()}://{parsed_base.netloc}'
+    probe = nox_android.probe_bwrap_sandbox(sandbox_available_override=sandbox_available_override)
+    if probe.get('status') != 'PASS':
+        return {
+            'status': 'BLOCKED',
+            'executed': False,
+            'executed_unprotected': False,
+            'sandbox_required': True,
+            'sandbox_status': 'BLOCKED',
+            'sandbox_probe': probe,
+            'reason': f"bubblewrap_sandbox_unavailable:{probe.get('reason', 'unknown')}",
+            'failures': ['bubblewrap_sandbox_unavailable'],
+            'beginner_message': (
+                'A verificação automática deste plugin não pôde ser executada com segurança neste computador. Nenhum código não confiável foi executado.'
+            ),
+        }
+
+    node_bin = shutil.which('node')
+    if not node_bin:
+        return {
+            'status': 'BLOCKED',
+            'executed': False,
+            'executed_unprotected': False,
+            'reason': 'node_binary_not_found',
+            'failures': ['node_binary_not_found'],
+            'beginner_message': (
+                'A verificação automática deste plugin não pôde ser executada com segurança neste computador porque o Node.js não está instalado. Nenhum código não confiável foi executado.'
+            ),
+        }
+
+    node_resolved = Path(node_bin).resolve()
+    extra_ro_binds: list[tuple[str, str]] = []
+    node_guest_bin = str(node_resolved)
+    if not node_guest_bin.startswith(('/usr/', '/bin/', '/sbin/')):
+        prefix_dir = node_resolved.parent.parent if node_resolved.parent.name == 'bin' else node_resolved.parent
+        extra_ro_binds.append((str(prefix_dir), '/sandbox-sdk/node'))
+        node_guest_bin = (
+            f'/sandbox-sdk/node/bin/{node_resolved.name}'
+            if node_resolved.parent.name == 'bin'
+            else f'/sandbox-sdk/node/{node_resolved.name}'
+        )
+
+    scheme = parsed_base.scheme.lower()
+    netloc = parsed_base.netloc.lower()
+    allowed_origin = f'{scheme}://{netloc}'
+    req_prefix = f'__NOX_FETCH_{secrets.token_hex(12)}__'
+    res_prefix = f'__NOX_RESULT_{secrets.token_hex(12)}__'
+
     fetch_shim = (
+        "import readline from 'node:readline';\n"
         f'const ALLOWED_ORIGIN = {json.dumps(allowed_origin)};\n'
+        f'const REQ_PREFIX = {json.dumps(req_prefix)};\n'
+        'const writeLine = process.stdout.write.bind(process.stdout);\n'
+        'const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });\n'
+        'const waiters = new Map();\n'
+        'let seq = 0;\n'
+        "rl.on('line', (line) => {\n"
+        '  try {\n'
+        '    const msg = JSON.parse(line);\n'
+        '    const cb = waiters.get(msg.id);\n'
+        '    if (cb) { waiters.delete(msg.id); cb(msg); }\n'
+        '  } catch {}\n'
+        '});\n'
         'export async function fetchApi(url) {\n'
-        '  const parsed = new URL(url);\n'
-        '  if (parsed.origin !== ALLOWED_ORIGIN) throw new Error("SSRF guard blocked origin: " + parsed.origin);\n'
-        '  return fetch(url);\n'
+        '  const parsed = new URL(String(url));\n'
+        '  if (parsed.origin.toLowerCase() !== ALLOWED_ORIGIN) {\n'
+        '    throw new Error("SSRF guard blocked origin: " + parsed.origin);\n'
+        '  }\n'
+        '  const id = ++seq;\n'
+        '  const resp = await new Promise((resolve, reject) => {\n'
+        f'    const timer = setTimeout(() => {{ waiters.delete(id); reject(new Error("bridge fetch timeout")); }}, {max(5000, timeout * 800)});\n'
+        '    waiters.set(id, (msg) => { clearTimeout(timer); resolve(msg); });\n'
+        '    writeLine(REQ_PREFIX + JSON.stringify({ id, url: parsed.toString() }) + "\\n");\n'
+        '  });\n'
+        '  if (resp.error && !resp.status) throw new Error("SSRF/fetch blocked: " + resp.error);\n'
+        '  const bodyText = String(resp.body || "");\n'
+        '  const status = Number(resp.status || 200);\n'
+        '  return {\n'
+        '    ok: status >= 200 && status < 300,\n'
+        '    status,\n'
+        '    url: resp.final_url || parsed.toString(),\n'
+        '    headers: { get: (k) => (String(k).toLowerCase() === "content-type" ? String(resp.content_type || "") : null) },\n'
+        '    text: async () => bodyText,\n'
+        '    json: async () => JSON.parse(bodyText),\n'
+        '  };\n'
         '}\n'
     )
     typings_shim = 'export const Plugin = {};\n'
 
-    ver_proc = subprocess.run([node_bin, '-p', 'process.versions.node'], capture_output=True, text=True, timeout=5)
-    ver_parts = tuple(int(x) for x in (ver_proc.stdout.strip().split('.')[:2] or ['0', '0']) if x.isdigit())
+    ver_proc = subprocess.run([node_bin, '--version'], capture_output=True, text=True, timeout=5)
+    ver_str = ver_proc.stdout.strip().lstrip('v')
+    ver_parts = tuple(int(x) for x in (ver_str.split('.')[:2] or ['0', '0']) if x.isdigit())
     use_strip_flag = ver_parts >= (22, 6)
 
     with tempfile.TemporaryDirectory(prefix='nox-lnr-exec-') as tmp:
@@ -1503,10 +1572,16 @@ def _execute_lnreader_ts_in_node(
 
         runner_mjs = tdir / 'runner.mjs'
         runner_mjs.write_text(
-            f"import mod from {json.dumps('./' + plugin_mod.name)};\n"
-            'const p = mod?.default ?? mod;\n'
+            "import '@libs/fetch';\n"
+            f'const RES_PREFIX = {json.dumps(res_prefix)};\n'
+            'const writeResultLine = process.stdout.write.bind(process.stdout);\n'
+            f"const imported = await import({json.dumps('./' + plugin_mod.name)});\n"
+            'const p = imported?.default?.default ?? imported?.default ?? imported;\n'
             'const pop = await p.popularNovels(1);\n'
-            'if (!Array.isArray(pop) || pop.length === 0) { console.log(JSON.stringify({ok:false, stage:"popularNovels", count:0})); process.exit(2); }\n'
+            'if (!Array.isArray(pop) || pop.length === 0) {\n'
+            '  writeResultLine(RES_PREFIX + JSON.stringify({ok:false, stage:"popularNovels", count:0}) + "\\n");\n'
+            '  process.exit(2);\n'
+            '}\n'
             'const tok = (pop[0].name || "Novel").split(/[^A-Za-z0-9]+/).find(Boolean) || pop[0].name;\n'
             'const found = await p.searchNovels(tok, 1);\n'
             'const miss = await p.searchNovels("NoxZeroResultProbe999", 1);\n'
@@ -1514,7 +1589,7 @@ def _execute_lnreader_ts_in_node(
             'const ch0 = det?.chapters?.[0];\n'
             'const chHtml = ch0 ? await p.parseChapter(ch0.path) : "";\n'
             'const txt = String(chHtml || "").replace(/<[^>]+>/g, " ").replace(/\\s+/g, " ").trim();\n'
-            'console.log(JSON.stringify({\n'
+            'writeResultLine(RES_PREFIX + JSON.stringify({\n'
             '  ok: Boolean(pop.length && found.length && det?.chapters?.length && txt.length >= 20),\n'
             '  popular_count: pop.length,\n'
             '  popular_first: pop[0],\n'
@@ -1524,18 +1599,165 @@ def _execute_lnreader_ts_in_node(
             '  chapters_count: det?.chapters?.length || 0,\n'
             '  chapter_text: txt.slice(0, 240),\n'
             '  chapter_has_noise: /<(?:nav|script|style)\\b/i.test(String(chHtml || "")),\n'
-            '}));\n',
+            '}) + "\\n");\n'
+            'process.exit(0);\n',
             encoding='utf-8',
         )
-        cmd = [node_bin, '--no-warnings'] + (['--experimental-strip-types'] if use_strip_flag else []) + [str(runner_mjs)]
-        proc = subprocess.run(cmd, cwd=tdir, capture_output=True, text=True, timeout=timeout)
-        if proc.returncode != 0:
-            err_msg = (proc.stderr or proc.stdout or f'node exited {proc.returncode}').strip()
-            return {'status': 'FAIL', 'executed': True, 'engine': 'node', 'error': err_msg[-400:]}
+        node_args = [node_guest_bin, '--no-warnings'] + (['--experimental-strip-types'] if use_strip_flag else []) + ['/work/runner.mjs']
+        bwrap_cmd = nox_android.build_bwrap_invocation(
+            tdir,
+            node_args,
+            allow_network=False,
+            extra_ro_binds=extra_ro_binds,
+            ro_work=True,
+        )
+        proc = subprocess.Popen(
+            bwrap_cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding='utf-8',
+            errors='replace',
+            start_new_session=True,
+        )
+        stderr_chunks: list[str] = []
+
+        def _drain_stderr() -> None:
+            total = 0
+            assert proc.stderr is not None
+            for chunk in iter(lambda: proc.stderr.read(2048), ''):
+                if total < 32_768:
+                    stderr_chunks.append(chunk)
+                    total += len(chunk)
+
+        err_thread = threading.Thread(target=_drain_stderr, daemon=True)
+        err_thread.start()
+
+        timed_out = threading.Event()
+
+        def _kill_pg() -> None:
+            timed_out.set()
+            try:
+                if proc.poll() is None:
+                    os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+        timer = threading.Timer(float(timeout), _kill_pg)
+        timer.daemon = True
+        timer.start()
+
+        result_line: str | None = None
+        fetch_count = 0
         try:
-            data = json.loads((proc.stdout or '').strip().splitlines()[-1])
+            assert proc.stdout is not None
+            assert proc.stdin is not None
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                if line.startswith(req_prefix):
+                    fetch_count += 1
+                    try:
+                        req_payload = json.loads(line[len(req_prefix):])
+                    except ValueError:
+                        req_payload = {}
+                    req_id = req_payload.get('id')
+                    req_url = str(req_payload.get('url') or '')
+                    if fetch_count > 32:
+                        resp_msg: dict[str, Any] = {'id': req_id, 'status': 0, 'error': 'bridge_fetch_limit_exceeded'}
+                    else:
+                        sp = urlsplit(req_url.strip())
+                        req_origin = f'{sp.scheme.lower()}://{sp.netloc.lower()}'
+                        if req_origin != allowed_origin:
+                            resp_msg = {'id': req_id, 'status': 0, 'error': f'blocked_origin:{req_origin}'}
+                        else:
+                            st, ct, body_bytes, ferr = safe_http_fetch(
+                                req_url,
+                                allow_local_fixture=allow_local_fixture,
+                                timeout=min(8, max(2, timeout)),
+                                allowed_hosts=(parsed_base.hostname,) if parsed_base.hostname else None,
+                            )
+                            resp_msg = {
+                                'id': req_id,
+                                'status': st,
+                                'content_type': ct,
+                                'body': body_bytes.decode('utf-8', errors='replace'),
+                                'error': ferr,
+                            }
+                    try:
+                        proc.stdin.write(json.dumps(resp_msg) + '\n')
+                        proc.stdin.flush()
+                    except (BrokenPipeError, OSError):
+                        break
+                elif line.startswith(res_prefix):
+                    result_line = line[len(res_prefix):].strip()
+        finally:
+            timer.cancel()
+            try:
+                if proc.stdin and not proc.stdin.closed:
+                    proc.stdin.close()
+            except OSError:
+                pass
+            try:
+                rc = proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                _kill_pg()
+                rc = proc.wait(timeout=3)
+            err_thread.join(timeout=1)
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream and not stream.closed:
+                        stream.close()
+                except OSError:
+                    pass
+
+        stderr_txt = ''.join(stderr_chunks).strip()
+        if timed_out.is_set():
+            return {
+                'status': 'FAIL',
+                'executed': True,
+                'executed_unprotected': False,
+                'sandboxed': True,
+                'sandbox': 'bubblewrap',
+                'engine': 'node',
+                'error': f'sandbox_timeout:{timeout}s',
+                'failures': ['sandbox_timeout'],
+            }
+        if rc != 0:
+            err_msg = (stderr_txt or f'node exited {rc}').strip()
+            return {
+                'status': 'FAIL',
+                'executed': True,
+                'executed_unprotected': False,
+                'sandboxed': True,
+                'sandbox': 'bubblewrap',
+                'engine': 'node',
+                'error': err_msg[-400:],
+            }
+        if not result_line:
+            return {
+                'status': 'FAIL',
+                'executed': True,
+                'executed_unprotected': False,
+                'sandboxed': True,
+                'sandbox': 'bubblewrap',
+                'engine': 'node',
+                'error': f'missing_node_result:{stderr_txt[-200:]}',
+            }
+        try:
+            data = json.loads(result_line)
         except Exception as exc:
-            return {'status': 'FAIL', 'executed': True, 'engine': 'node', 'error': f'invalid_node_output:{exc}'}
+            return {
+                'status': 'FAIL',
+                'executed': True,
+                'executed_unprotected': False,
+                'sandboxed': True,
+                'sandbox': 'bubblewrap',
+                'engine': 'node',
+                'error': f'invalid_node_output:{exc}',
+            }
 
         sr = audit_search_and_pagination(
             data.get('popular_first', {}).get('name', 'Item'),
@@ -1551,6 +1773,9 @@ def _execute_lnreader_ts_in_node(
         return {
             'status': 'PASS' if ok else 'FAIL',
             'executed': True,
+            'executed_unprotected': False,
+            'sandboxed': True,
+            'sandbox': 'bubblewrap',
             'engine': 'node',
             'details': data,
             'checks': {'search': sr, 'novel': nr},
@@ -1782,14 +2007,20 @@ def execute_extension_behavior(
     base_url: str,
     *,
     allow_local_fixture: bool = False,
+    sandbox_available_override: bool | None = None,
 ) -> dict[str, Any]:
-    """Execute generated or repaired extension code (.ts via Node.js or .kt via parsed HTTP flow) against target site."""
+    """Execute generated or repaired extension code (.ts via sandboxed Node.js or .kt via parsed HTTP flow) against target site."""
     paths = [Path(p) for p in code_files if Path(p).is_file()]
     if ecosystem == 'lnreader':
         ts_file = next((p for p in paths if p.suffix in {'.ts', '.js'}), None)
         if ts_file is None:
             return {'status': 'FAIL', 'executed': False, 'reason': 'missing_lnreader_ts_file', 'failures': ['missing_ts_file']}
-        return _execute_lnreader_ts_in_node(ts_file, base_url, allow_local_fixture=allow_local_fixture)
+        return _execute_lnreader_ts_in_node(
+            ts_file,
+            base_url,
+            allow_local_fixture=allow_local_fixture,
+            sandbox_available_override=sandbox_available_override,
+        )
 
     kt_file = next((p for p in paths if p.suffix == '.kt'), None)
     if kt_file is None:
@@ -2036,6 +2267,7 @@ def auto_create_extension(
             persisted_files,
             resolved_url.rstrip('/'),
             allow_local_fixture=allow_local_fixture,
+            sandbox_available_override=sandbox_available_override,
         )
 
     static_ok = pkg_val.get('status') == 'PASS'
@@ -2125,6 +2357,9 @@ def auto_create_extension(
     elif not probe.get('reachable'):
         status = 'INCONCLUSIVE'
         limitations.append(str(probe.get('error') or 'Could not reach target site.'))
+    elif behavior_res.get('status') == 'BLOCKED':
+        status = 'BLOCKED'
+        limitations.append(str(behavior_res.get('beginner_message') or behavior_res.get('reason') or 'Plugin execution blocked cleanly because sandbox isolation is unavailable.'))
     elif not static_ok or not probe_ok or not behavior_ok:
         status = 'FAIL'
         limitations.append(str(behavior_res.get('reason') or probe.get('error') or ','.join(pkg_val.get('issues') or [])))
@@ -2185,6 +2420,17 @@ def auto_create_extension(
             f'Saved at: {persisted_files[0]}'
             if (is_en and persisted_files)
             else f'Arquivo salvo em: {persisted_files[0] if persisted_files else persisted_dir}'
+        )
+    elif status == 'BLOCKED' and behavior_res.get('status') == 'BLOCKED':
+        msg = (
+            'The automated verification of this plugin could not run safely on this computer. No untrusted code was executed.'
+            if is_en
+            else 'A verificação automática deste plugin não pôde ser executada com segurança neste computador. Nenhum código não confiável foi executado.'
+        )
+        nxt = (
+            'Your plugin files were saved safely. Enable Bubblewrap sandbox support (bwrap) and run the verification again.'
+            if is_en
+            else 'Os arquivos do plugin foram salvos com segurança. Ative o sandbox Bubblewrap (bwrap) para executar a verificação com isolamento.'
         )
     elif build_res is not None and build_res.get('status') == 'BLOCKED':
         msg = (
@@ -2710,7 +2956,13 @@ def auto_fix_extension(
         allow_local_fixture=allow_local_fixture,
     )
     behavior_before = (
-        execute_extension_behavior(eco, code_files, resolved_site.rstrip('/'), allow_local_fixture=allow_local_fixture)
+        execute_extension_behavior(
+            eco,
+            code_files,
+            resolved_site.rstrip('/'),
+            allow_local_fixture=allow_local_fixture,
+            sandbox_available_override=sandbox_available_override,
+        )
         if (resolved_site and probe.get('reachable') and code_files)
         else {'status': 'INCONCLUSIVE', 'failures': []}
     )
@@ -2726,7 +2978,13 @@ def auto_fix_extension(
     modified_p1, changes_p1 = _apply_automated_code_repairs(tpath, eco, symptom, probe)
     # Re-evaluate intermediate behavior before deciding on Pass 2
     mid_behavior = (
-        execute_extension_behavior(eco, code_files, resolved_site.rstrip('/'), allow_local_fixture=allow_local_fixture)
+        execute_extension_behavior(
+            eco,
+            code_files,
+            resolved_site.rstrip('/'),
+            allow_local_fixture=allow_local_fixture,
+            sandbox_available_override=sandbox_available_override,
+        )
         if (resolved_site and probe.get('reachable') and code_files)
         else {'status': 'INCONCLUSIVE', 'failures': []}
     )
@@ -2754,7 +3012,13 @@ def auto_fix_extension(
         allow_local_fixture=allow_local_fixture,
     )
     behavior_after = (
-        execute_extension_behavior(eco, code_files, resolved_site.rstrip('/'), allow_local_fixture=allow_local_fixture)
+        execute_extension_behavior(
+            eco,
+            code_files,
+            resolved_site.rstrip('/'),
+            allow_local_fixture=allow_local_fixture,
+            sandbox_available_override=sandbox_available_override,
+        )
         if (resolved_site and probe.get('reachable') and code_files)
         else {'status': 'INCONCLUSIVE', 'failures': []}
     )
@@ -2774,7 +3038,15 @@ def auto_fix_extension(
 
     after_failures = sorted(set((static_after.get('failures') or []) + (behavior_after.get('failures') or [])))
     after_verification = {
-        'status': 'PASS' if (not after_failures and behavior_after.get('status') == 'PASS' and static_after.get('status') == 'PASS') else ('INCONCLUSIVE' if not probe.get('reachable') else 'FAIL'),
+        'status': (
+            'BLOCKED'
+            if behavior_after.get('status') == 'BLOCKED'
+            else (
+                'PASS'
+                if (not after_failures and behavior_after.get('status') == 'PASS' and static_after.get('status') == 'PASS')
+                else ('INCONCLUSIVE' if not probe.get('reachable') else 'FAIL')
+            )
+        ),
         'failures': after_failures,
         'static': static_after,
         'behavior': behavior_after,
@@ -2861,7 +3133,10 @@ def auto_fix_extension(
     }
 
     limitations: list[str] = []
-    if build_res is not None and build_res.get('status') == 'FAIL':
+    if behavior_after.get('status') == 'BLOCKED':
+        status = 'BLOCKED'
+        limitations.append(str(behavior_after.get('beginner_message') or behavior_after.get('reason') or 'Plugin verification blocked cleanly because sandbox isolation is unavailable.'))
+    elif build_res is not None and build_res.get('status') == 'FAIL':
         status = 'FAIL'
         limitations.append(str(build_res.get('reason') or 'APK build failed.'))
     elif code_modified and tests_verified and eco == 'lnreader':
@@ -2934,6 +3209,17 @@ def auto_fix_extension(
             f'Updated files saved: {", ".join(Path(p).name for p in modified_files)}'
             if is_en
             else f'Arquivos atualizados salvos: {", ".join(Path(p).name for p in modified_files)}'
+        )
+    elif status == 'BLOCKED' and behavior_after.get('status') == 'BLOCKED':
+        msg = (
+            'The automated verification of this plugin could not run safely on this computer. No untrusted code was executed.'
+            if is_en
+            else 'A verificação automática deste plugin não pôde ser executada com segurança neste computador. Nenhum código não confiável foi executado.'
+        )
+        nxt = (
+            'Any safe source updates remain on disk. Enable Bubblewrap sandbox support (bwrap) and run the verification again.'
+            if is_en
+            else 'Eventuais ajustes seguros foram preservados no arquivo. Ative o sandbox Bubblewrap (bwrap) para concluir a verificação com isolamento.'
         )
     elif build_res is not None and build_res.get('status') in {'BLOCKED', 'FAIL'}:
         msg = (

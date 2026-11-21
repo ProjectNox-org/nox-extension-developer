@@ -9,4 +9,10 @@ For the Portuguese version, see [CONTRIBUTING.md](CONTRIBUTING.md).
 5. Run `python3 -m unittest discover -s tests -v` from the project root.
 6. Open a pull request with a summary, motivation, tests, compatibility, and risks. Remove secrets and personal data from examples and logs.
 
+## Versioning (`MAJOR.MINOR.PATCH`)
+
+- **MAJOR (`X.0.0`):** major releases, redesigns, and significant architectural or feature changes.
+- **MINOR (`X.Y.0`):** important updates, new features, and relevant improvements preserving compatibility where expected.
+- **PATCH (`X.Y.Z`):** bug fixes, security vulnerability patches, and targeted adjustments.
+
 For security issues, follow [SECURITY.md](SECURITY.md), not a public issue.

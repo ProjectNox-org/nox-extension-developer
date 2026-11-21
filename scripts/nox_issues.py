@@ -10,11 +10,9 @@ import re
 import shutil
 import subprocess
 from typing import Any, Callable, Sequence
-import urllib.error
 import urllib.parse
-import urllib.request
 
-from nox_core import atomic_write_text, make_receipt, sanitize_text, scan_prompt_injection
+from nox_core import atomic_write_text, make_receipt, safe_http_fetch_detailed, sanitize_text, scan_prompt_injection
 
 
 ECOSYSTEM_REPOS: dict[str, str] = {
@@ -324,7 +322,7 @@ def record_verified_patch(
 
 
 def _default_github_get_json(endpoint: str) -> Any:
-    """Fetch read-only public GitHub API JSON via gh CLI if available, falling back to HTTPS urllib."""
+    """Fetch read-only public GitHub API JSON via gh CLI if available, falling back to pinned HTTPS."""
     clean_ep = endpoint.lstrip('/')
     gh_bin = shutil.which('gh')
     if gh_bin:
@@ -333,12 +331,16 @@ def _default_github_get_json(endpoint: str) -> Any:
             return json.loads(proc.stdout)
 
     url = f'https://api.github.com/{clean_ep}'
-    req = urllib.request.Request(
+    res = safe_http_fetch_detailed(
         url,
-        headers={'User-Agent': 'nox-extension-developer/1.2', 'Accept': 'application/vnd.github+json'},
+        allow_local_fixture=False,
+        timeout=20,
+        allowed_hosts=('api.github.com',),
+        headers={'User-Agent': 'nox-extension-developer/2.1', 'Accept': 'application/vnd.github+json'},
     )
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read(2_000_000).decode('utf-8'))
+    if res.get('error') or int(res.get('status') or 0) >= 400:
+        raise OSError(res.get('error') or f"GitHub API HTTP {res.get('status')}")
+    return json.loads(bytes(res['body']).decode('utf-8'))
 
 
 def generate_preventive_test_spec(classified_record: dict[str, Any], raw_record: dict[str, Any]) -> dict[str, Any]:
@@ -393,7 +395,7 @@ def fetch_ecosystem_issues_and_prs(
         else:
             issues_raw = get_json(f'repos/{repo}/issues?state=all&per_page={limit}')
         pulls_raw = get_json(f'repos/{repo}/pulls?state=all&per_page={limit}')
-    except (OSError, ValueError, urllib.error.URLError, subprocess.SubprocessError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         return {
             'status': 'BLOCKED',
             'ecosystem': ecosystem,
@@ -658,7 +660,7 @@ def _inspect_ecosystem_pr_batch(
                 'post_merge_verified': bool(pr_raw.get('merged') and pr_raw.get('merged_at') and has_test_evidence),
             }
             data_src = 'github_api_live'
-        except (OSError, ValueError, urllib.error.URLError, subprocess.SubprocessError):
+        except (OSError, ValueError, subprocess.SubprocessError):
             live_mode = False
             snap = dict(pinned_pulls[num])
             files_raw = snap.pop('files', [])
