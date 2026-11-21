@@ -66,6 +66,64 @@ Selecione seu agente quando solicitado (ou informe o alvo diretamente, por exemp
 - `npx skills add` instala **somente** a skill — ele não instala nem configura Java JDK, Android SDK ou dependências do LNReader.
 - Após instalar, **abra uma nova sessão do agente** e peça explicitamente: `Use a skill nox-extension-developer`. Consulte os detalhes completos no [guia de instalação](docs/pt-BR/guia.md).
 
+## Como atualizar a skill
+
+### Método 1 — Atualização assistida por IA (recomendado)
+
+Copie o texto abaixo, cole em seu agente de IA compatível e autorize apenas as etapas com as quais concordar:
+
+```text
+Atualize minha instalação existente da skill Nox Extension Developer para a
+versão estável mais recente, seguindo a documentação oficial e preservando
+minhas configurações.
+
+Repositório:
+https://github.com/ProjectNox-org/nox-extension-developer
+
+Identifique meu sistema operacional, agente de IA, método de instalação
+e caminhos utilizados.
+
+Consulte a versão estável mais recente publicada nas GitHub Releases e
+compare com a versão instalada. Não confunda a branch main com uma
+release estável.
+
+Antes de atualizar, verifique alterações locais e faça backup das
+configurações e personalizações existentes.
+
+Atualize somente a Nox Extension Developer, sem modificar outras skills,
+dependências desnecessárias ou configurações do agente.
+
+Não sobrescreva arquivos personalizados, apague dados ou execute
+comandos administrativos sem minha autorização.
+
+Se houver conflitos, apresente-os antes de continuar.
+
+Após atualizar, confirme a versão/tag/commit realmente instalado,
+verifique se a skill continua sendo reconhecida pelo agente e informe
+o resultado e quaisquer limitações.
+```
+
+### Método 2 — Atualização manual
+
+Para verificar atualizações disponíveis e atualizar usando a [Skills CLI](https://github.com/vercel-labs/skills/blob/main/docs/commands.md):
+
+```bash
+npx skills check
+npx skills update nox-extension-developer
+```
+
+Para instalação global:
+
+```bash
+npx skills update nox-extension-developer --global
+```
+
+- Use esses comandos apenas para instalações gerenciadas pela Skills CLI (`npx skills`).
+- As atualizações podem acompanhar a origem registrada na instalação, inclusive a branch `main`, e não necessariamente a última GitHub Release estável.
+- Instalações manuais via Git ou links simbólicos (como por [`scripts/install.py`](scripts/install.py)) podem exigir outro procedimento, como atualizar o repositório local para a tag de release desejada.
+- Identifique e preserve suas personalizações locais antes de qualquer substituição, pois a CLI não garante preservação automática de alterações ou configurações locais.
+- Após atualizar, valide a instalação em uma **nova sessão do agente** solicitando `Use a skill nox-extension-developer`.
+
 ## Como usar na prática
 
 Substitua os campos entre colchetes pelas informações do site ou repositório desejado.
@@ -183,7 +241,7 @@ Todos os relatórios distinguem explicitamente **`PASS` / `FAIL` / `INCONCLUSIVE
 - **Preciso instalar o Android SDK?** Sim apenas para compilar APKs de mangá (Keiyoushi) ou anime (Yuzono). Para plugins LNReader de novels, **não**.
 - **Quais agentes são compatíveis?** A execução foi verificada no OpenCode (`v2.2.7` em Arch Linux); Codex, Claude Code e Google Antigravity possuem caminhos documentados sem homologação oficial, e Hermes Agent não foi verificado.
 - **O que fazer se a skill não for reconhecida?** Abra uma nova sessão do agente, solicite `Use nox-extension-developer` pelo nome exato e confira o caminho/link de instalação no [guia de solução de problemas](docs/pt-BR/guia.md#solução-de-problemas).
-- **Onde estão as instruções de atualização ou remoção?** Veja `npx skills update --help`, `npx skills remove --help` e as instruções manuais na seção de [instalação e remoção do guia](docs/pt-BR/guia.md#instalação).
+- **Onde estão as instruções de atualização ou remoção?** Para atualizar, consulte [Como atualizar a skill](#como-atualizar-a-skill). Para remoção, veja `npx skills remove --help` e as instruções manuais na seção de [instalação e remoção do guia](docs/pt-BR/guia.md#instalação).
 
 ## Suporte e contribuições
 

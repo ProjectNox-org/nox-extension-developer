@@ -66,6 +66,63 @@ Choose your agent when prompted (or pass flags such as `--global --agent opencod
 - `npx skills add` installs **only** the skill — it does not install or configure a Java JDK, Android SDK, or LNReader project dependencies.
 - After installation, **start a new agent session** and explicitly ask: `Use the nox-extension-developer skill`. See full details in the [installation guide](docs/en/guide.md).
 
+## How to update the skill
+
+### Method 1 — AI-assisted update (recommended)
+
+Copy the prompt below into your compatible AI agent and approve only the steps you agree with:
+
+```text
+Update my existing installation of the Nox Extension Developer skill to the
+latest stable version, following the official documentation and preserving my
+settings.
+
+Repository:
+https://github.com/ProjectNox-org/nox-extension-developer
+
+Identify my operating system, AI agent, installation method, and paths used.
+
+Check the latest stable version published in GitHub Releases and compare it
+with the installed version. Do not confuse the main branch with a stable
+release.
+
+Before updating, check for local changes and back up existing settings and
+customizations.
+
+Update only Nox Extension Developer, without modifying other skills,
+unnecessary dependencies, or agent configurations.
+
+Do not overwrite custom files, delete data, or run privileged commands without
+my authorization.
+
+If there are conflicts, present them before continuing.
+
+After updating, confirm the actual installed version/tag/commit, verify that
+the skill is still recognized by the agent, and report the result and any
+limitations.
+```
+
+### Method 2 — Manual update
+
+To check for available updates and update using the [Skills CLI](https://github.com/vercel-labs/skills/blob/main/docs/commands.md):
+
+```bash
+npx skills check
+npx skills update nox-extension-developer
+```
+
+For a global installation:
+
+```bash
+npx skills update nox-extension-developer --global
+```
+
+- Use these commands only for installations managed by the Skills CLI (`npx skills`).
+- Updates may track the recorded installation source, including the `main` branch, rather than necessarily targeting the latest stable GitHub Release.
+- Manual installations via Git or symlinks (such as [`scripts/install.py`](scripts/install.py)) may require a different procedure, such as updating the local repository to the desired release tag.
+- Identify and back up any local customizations before replacing files, as the CLI does not guarantee automatic preservation of local changes or settings.
+- After updating, validate the installation in a **new agent session** by asking: `Use the nox-extension-developer skill`.
+
 ## Practical examples
 
 Replace the bracketed placeholders with the target website or repository details.
@@ -183,7 +240,7 @@ Every report strictly distinguishes **`PASS` / `FAIL` / `INCONCLUSIVE` / `BLOCKE
 - **Do I need to install the Android SDK?** Only if you build manga (Keiyoushi) or anime (Yuzono) APKs. For LNReader novel plugins, **no**.
 - **Which agents are supported?** Execution was verified on OpenCode (`v2.2.7` on Arch Linux); Codex, Claude Code, and Google Antigravity have documented paths without official verification, and Hermes Agent has not been verified.
 - **What if my agent does not recognize the skill?** Start a new session, ask for `Use the nox-extension-developer skill` by exact name, and check the installed path/symlink in the [troubleshooting guide](docs/en/guide.md#troubleshooting).
-- **Where are update or removal instructions?** See `npx skills update --help`, `npx skills remove --help`, and the manual symlink instructions in the [installation and removal guide](docs/en/guide.md#installation).
+- **Where are update or removal instructions?** For updates, see [How to update the skill](#how-to-update-the-skill). For removal, see `npx skills remove --help` and the manual symlink instructions in the [installation and removal guide](docs/en/guide.md#installation).
 
 ## Support and contributions
 
