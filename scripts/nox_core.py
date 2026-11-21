@@ -6,13 +6,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 import datetime as dt
 import hashlib
+import http.client
 import ipaddress
 import json
 import os
 from pathlib import Path
 import re
+import socket
+import ssl
 import tempfile
-from typing import Any, Iterable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urljoin, urlsplit, urlunsplit
 
 
@@ -257,24 +260,241 @@ def scan_prompt_injection(text: str, source_label: str = 'remote-data') -> dict[
     }
 
 
+_SPECIAL_IPV4_NETS: tuple[ipaddress.IPv4Network, ...] = (
+    ipaddress.IPv4Network('0.0.0.0/8'),
+    ipaddress.IPv4Network('10.0.0.0/8'),
+    ipaddress.IPv4Network('100.64.0.0/10'),
+    ipaddress.IPv4Network('127.0.0.0/8'),
+    ipaddress.IPv4Network('169.254.0.0/16'),
+    ipaddress.IPv4Network('172.16.0.0/12'),
+    ipaddress.IPv4Network('192.0.0.0/24'),
+    ipaddress.IPv4Network('192.0.2.0/24'),
+    ipaddress.IPv4Network('192.168.0.0/16'),
+    ipaddress.IPv4Network('198.18.0.0/15'),
+    ipaddress.IPv4Network('198.51.100.0/24'),
+    ipaddress.IPv4Network('203.0.113.0/24'),
+    ipaddress.IPv4Network('224.0.0.0/4'),
+    ipaddress.IPv4Network('240.0.0.0/4'),
+)
+
+_SPECIAL_IPV6_NETS: tuple[ipaddress.IPv6Network, ...] = (
+    ipaddress.IPv6Network('::/128'),
+    ipaddress.IPv6Network('::1/128'),
+    ipaddress.IPv6Network('100::/64'),
+    ipaddress.IPv6Network('2001:db8::/32'),
+    ipaddress.IPv6Network('fc00::/7'),
+    ipaddress.IPv6Network('fe80::/10'),
+    ipaddress.IPv6Network('ff00::/8'),
+)
+
+
+def is_non_public_ip(ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True if IP address is loopback, private, link-local, multicast, CGNAT, reserved, or encapsulates one."""
+    if isinstance(ip_obj, ipaddress.IPv4Address):
+        if (
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_multicast
+            or ip_obj.is_reserved
+            or ip_obj.is_unspecified
+            or not ip_obj.is_global
+        ):
+            return True
+        return any(ip_obj in net for net in _SPECIAL_IPV4_NETS)
+
+    # IPv6 checks + embedded/tunneled IPv4 extraction
+    if (
+        ip_obj.is_private
+        or ip_obj.is_loopback
+        or ip_obj.is_link_local
+        or ip_obj.is_multicast
+        or ip_obj.is_reserved
+        or ip_obj.is_unspecified
+        or not ip_obj.is_global
+    ):
+        return True
+    if any(ip_obj in net for net in _SPECIAL_IPV6_NETS):
+        return True
+    if ip_obj.ipv4_mapped is not None and is_non_public_ip(ip_obj.ipv4_mapped):
+        return True
+    if ip_obj.sixtofour is not None and is_non_public_ip(ip_obj.sixtofour):
+        return True
+    if ip_obj.teredo is not None:
+        srv, cli = ip_obj.teredo
+        if is_non_public_ip(srv) or is_non_public_ip(cli):
+            return True
+    raw_int = int(ip_obj)
+    # NAT64 prefixes (64:ff9b::/96 and 64:ff9b:1::/48) & IPv4-compatible (::/96)
+    if (raw_int >> 32) in {0, 0x0064FF9B0000000000000000} or (raw_int >> 96) == 0x0064FF9B:
+        embedded_v4 = ipaddress.IPv4Address(raw_int & 0xFFFFFFFF)
+        if is_non_public_ip(embedded_v4):
+            return True
+    return False
+
+
+def _classify_host_strict(host: str) -> tuple[str, str, ipaddress.IPv4Address | ipaddress.IPv6Address | None, str | None]:
+    """Classify host strictly as ('ip'|'domain'|'invalid', clean_host, ip_obj, reason), rejecting non-canonical IPv4 formats."""
+    raw = (host or '').strip()
+    if not raw:
+        return 'invalid', '', None, 'missing hostname'
+    if any(ch in raw for ch in (' ', '\t', '\r', '\n', '\\', '@', '/', '?', '#')):
+        return 'invalid', raw, None, 'invalid characters in hostname'
+    if '%' in raw:
+        return 'invalid', raw, None, 'IPv6 zone IDs are disallowed'
+
+    has_trailing_dot = raw.endswith('.')
+    stripped = raw.rstrip('.').lower()
+    if not stripped:
+        return 'invalid', raw, None, 'empty hostname'
+
+    # Bracketed or raw IPv6 literal
+    if ':' in stripped or stripped.startswith('[') or stripped.endswith(']'):
+        if has_trailing_dot:
+            return 'invalid', raw, None, 'trailing dot on IP literal is disallowed'
+        bare_v6 = stripped[1:-1] if (stripped.startswith('[') and stripped.endswith(']')) else stripped
+        try:
+            ip6 = ipaddress.IPv6Address(bare_v6)
+            return 'ip', bare_v6, ip6, None
+        except ValueError:
+            return 'invalid', raw, None, f'malformed IPv6 literal: {raw}'
+
+    # Reject non-canonical integer, hex, octal, or shorthand IPv4 notations
+    parts = stripped.split('.')
+    numeric_part_rx = re.compile(r'^(?:0x[0-9a-f]+|0b[01]+|0[0-7]*|[1-9]\d*)$', re.I)
+    if len(parts) == 1 and numeric_part_rx.fullmatch(parts[0]):
+        return 'invalid', raw, None, f'non-canonical integer/hex IP notation rejected: {raw}'
+    if all(numeric_part_rx.fullmatch(p) for p in parts):
+        if has_trailing_dot:
+            return 'invalid', raw, None, f'trailing dot on IP literal is disallowed: {raw}'
+        if len(parts) != 4:
+            return 'invalid', raw, None, f'shorthand IPv4 notation rejected: {raw}'
+        if any(p.lower().startswith(('0x', '0b')) or (p.startswith('0') and len(p) > 1) for p in parts):
+            return 'invalid', raw, None, f'non-canonical octal/hex IPv4 segment rejected: {raw}'
+        try:
+            ip4 = ipaddress.IPv4Address(stripped)
+            if str(ip4) != stripped:
+                return 'invalid', raw, None, f'non-canonical IPv4 notation rejected: {raw}'
+            return 'ip', stripped, ip4, None
+        except ValueError:
+            return 'invalid', raw, None, f'malformed IPv4 literal: {raw}'
+
+    # Final safety net: reject any ambiguous notation accepted by OS inet_aton
+    try:
+        socket.inet_aton(stripped)
+        return 'invalid', raw, None, f'ambiguous IPv4 notation rejected: {raw}'
+    except OSError:
+        pass
+
+    # IDNA-normalize valid domain hostnames
+    try:
+        ascii_host = stripped.encode('idna').decode('ascii').lower()
+    except UnicodeError:
+        return 'invalid', raw, None, f'invalid IDNA hostname: {raw}'
+    if '..' in ascii_host or ascii_host.startswith('.') or not re.fullmatch(r'[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*', ascii_host):
+        return 'invalid', raw, None, f'invalid domain syntax: {raw}'
+    return 'domain', ascii_host, None, None
+
+
 def is_private_or_reserved_host(host: str) -> bool:
-    """Return True if host is localhost, a private/loopback/link-local IP, or cloud metadata endpoint."""
-    h = host.strip().lower().rstrip('.')
-    if not h or h in {'localhost', 'localhost.localdomain', 'metadata.google.internal'}:
+    """Return True if host is localhost, a private/loopback/link-local/non-canonical IP, or internal endpoint."""
+    kind, clean, ip_obj, _ = _classify_host_strict(host)
+    if kind == 'invalid':
         return True
-    if h.endswith('.local') or h.endswith('.internal'):
+    if kind == 'ip' and ip_obj is not None:
+        return is_non_public_ip(ip_obj)
+    if clean in {'localhost', 'localhost.localdomain', 'metadata.google.internal', 'metadata', 'instance-data'}:
         return True
-    try:
-        ip = ipaddress.ip_address(h.strip('[]'))
-        return bool(ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified)
-    except ValueError:
-        return False
+    if clean.endswith(('.localhost', '.local', '.internal', '.localdomain')):
+        return True
+    return False
 
 
-def is_safe_public_url(url: str, *, allow_private_fixture: bool = False) -> tuple[bool, str]:
-    """Validate URL scheme and guard against SSRF to local/private/metadata addresses."""
+def _is_explicit_loopback_target(kind: str, clean_host: str, ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address | None) -> bool:
+    if kind == 'ip' and ip_obj is not None:
+        return bool(ip_obj.is_loopback)
+    return kind == 'domain' and clean_host == 'localhost'
+
+
+def _default_dns_resolver(host: str, port: int) -> list[str]:
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    ips: list[str] = []
+    for _fam, _type, _proto, _canon, sockaddr in infos:
+        raw_ip = str(sockaddr[0]).split('%', 1)[0]
+        if raw_ip not in ips:
+            ips.append(raw_ip)
+    return ips
+
+
+def resolve_and_validate_host(
+    host: str,
+    port: int,
+    *,
+    allow_loopback_fixture: bool = False,
+    resolver: Callable[[str, int], Sequence[str]] | None = None,
+) -> tuple[bool, list[str], str]:
+    """Resolve hostname once and validate EVERY returned IP against non-public/SSRF ranges before connecting."""
+    kind, clean_host, ip_obj, err = _classify_host_strict(host)
+    if kind == 'invalid':
+        return False, [], err or 'invalid host'
+
+    if kind == 'ip' and ip_obj is not None:
+        if ip_obj.is_loopback and allow_loopback_fixture:
+            return True, [str(ip_obj)], 'ok'
+        if is_non_public_ip(ip_obj):
+            return False, [], f'non-public IP blocked: {ip_obj}'
+        return True, [str(ip_obj)], 'ok'
+
+    # Domain name validation
+    is_loopback_name = clean_host == 'localhost'
+    if is_private_or_reserved_host(clean_host) and not (allow_loopback_fixture and is_loopback_name):
+        return False, [], f'private or reserved domain blocked: {clean_host}'
+
+    dns_fn = resolver or _default_dns_resolver
     try:
-        parsed = urlsplit(url.strip())
+        resolved_raw = list(dns_fn(clean_host, int(port)))
+    except OSError as exc:
+        return False, [], f'DNS resolution failed for {clean_host}: {exc}'
+    if not resolved_raw:
+        return False, [], f'DNS returned no addresses for {clean_host}'
+
+    validated_ips: list[str] = []
+    for raw_ip in resolved_raw:
+        cand = str(raw_ip).strip().split('%', 1)[0].strip('[]')
+        try:
+            addr = ipaddress.ip_address(cand)
+        except ValueError:
+            return False, [], f'DNS returned invalid IP literal: {raw_ip!r}'
+        if allow_loopback_fixture and is_loopback_name:
+            if not addr.is_loopback:
+                return False, [], f'localhost fixture must resolve strictly to loopback, got {addr}'
+        elif is_non_public_ip(addr):
+            return False, [], f'DNS resolved {clean_host} to blocked non-public IP {addr}'
+        norm_ip = str(addr)
+        if norm_ip not in validated_ips:
+            validated_ips.append(norm_ip)
+    return True, validated_ips, 'ok'
+
+
+def is_safe_public_url(
+    url: str,
+    *,
+    allow_private_fixture: bool = False,
+    resolve_dns: bool = False,
+    resolver: Callable[[str, int], Sequence[str]] | None = None,
+) -> tuple[bool, str]:
+    """Validate URL syntax, non-canonical IPs, scheme, and guard against SSRF (with optional live DNS verification)."""
+    raw_s = (url or '').strip()
+    if any(ch in raw_s for ch in ('\r', '\n', '\t', '\x00')):
+        return False, 'control characters in URL are disallowed'
+    # Guard against backslash confusion in authority (`http://evil\@127.0.0.1`)
+    if '://' in raw_s:
+        after_scheme = raw_s.split('://', 1)[1]
+        auth_part = re.split(r'[/?#]', after_scheme, maxsplit=1)[0]
+        if '\\' in auth_part:
+            return False, 'backslash in URL authority is disallowed'
+    try:
+        parsed = urlsplit(raw_s)
     except ValueError as exc:
         return False, f'invalid URL syntax: {exc}'
     scheme = parsed.scheme.lower()
@@ -284,9 +504,225 @@ def is_safe_public_url(url: str, *, allow_private_fixture: bool = False) -> tupl
         return False, 'missing hostname'
     if parsed.username or parsed.password:
         return False, 'embedded credentials in URL are disallowed'
-    if not allow_private_fixture and is_private_or_reserved_host(parsed.hostname):
+    try:
+        port = parsed.port or (443 if scheme == 'https' else 80)
+    except ValueError as exc:
+        return False, f'invalid URL port: {exc}'
+
+    kind, clean_host, ip_obj, host_err = _classify_host_strict(parsed.hostname)
+    if kind == 'invalid':
+        return False, host_err or 'invalid hostname'
+
+    if allow_private_fixture:
+        if _is_explicit_loopback_target(kind, clean_host, ip_obj):
+            if resolve_dns:
+                ok_dns, _, dns_err = resolve_and_validate_host(
+                    clean_host, port, allow_loopback_fixture=True, resolver=resolver,
+                )
+                return ok_dns, dns_err
+            return True, 'ok'
+        if is_private_or_reserved_host(parsed.hostname):
+            return False, f'non-loopback private or reserved host blocked even in fixture mode: {parsed.hostname}'
+    elif is_private_or_reserved_host(parsed.hostname):
         return False, f'private or reserved host blocked: {parsed.hostname}'
+
+    if resolve_dns:
+        ok_dns, _, dns_err = resolve_and_validate_host(
+            clean_host, port, allow_loopback_fixture=False, resolver=resolver,
+        )
+        return ok_dns, dns_err
     return True, 'ok'
+
+
+class _PinnedHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection connecting directly to a pre-validated IP (prevents DNS rebinding and ignores env proxies)."""
+
+    def __init__(self, pinned_ip: str, tls_hostname: str, port: int, timeout: float = 8.0) -> None:
+        super().__init__(host=tls_hostname, port=port, timeout=timeout)
+        self._pinned_ip = pinned_ip
+        self._tls_hostname = tls_hostname
+
+    def connect(self) -> None:
+        self.sock = socket.create_connection((self._pinned_ip, self.port), self.timeout, self.source_address)
+        if self._tunnel_host:
+            self._tunnel()
+
+
+class _PinnedHTTPSConnection(http.client.HTTPSConnection):
+    """HTTPSConnection connecting to pinned IP while validating TLS certificates and SNI against original hostname."""
+
+    def __init__(
+        self,
+        pinned_ip: str,
+        tls_hostname: str,
+        port: int,
+        timeout: float = 8.0,
+        context: ssl.SSLContext | None = None,
+    ) -> None:
+        ctx = context or ssl.create_default_context()
+        if context is None:
+            ctx.check_hostname = True
+            ctx.verify_mode = ssl.CERT_REQUIRED
+        super().__init__(host=tls_hostname, port=port, timeout=timeout, context=ctx)
+        self._pinned_ip = pinned_ip
+        self._tls_hostname = tls_hostname
+
+    def connect(self) -> None:
+        raw_sock = socket.create_connection((self._pinned_ip, self.port), self.timeout, self.source_address)
+        try:
+            self.sock = self._context.wrap_socket(raw_sock, server_hostname=self._tls_hostname)
+        except BaseException:
+            raw_sock.close()
+            raise
+
+
+def safe_http_fetch_detailed(
+    url: str,
+    *,
+    allow_local_fixture: bool = False,
+    timeout: int = 8,
+    headers: dict[str, str] | None = None,
+    max_redirects: int = 5,
+    max_bytes: int = 2_000_000,
+    allowed_hosts: Iterable[str] | None = None,
+    resolver: Callable[[str, int], Sequence[str]] | None = None,
+    ssl_context: ssl.SSLContext | None = None,
+    _connection_factory: Callable[[str, str, str, int, float, ssl.SSLContext | None], Any] | None = None,
+) -> dict[str, Any]:
+    """Fetch HTTP/HTTPS safely with DNS validation, IP pinning, TLS SNI/cert enforcement, hop-by-hop redirect checks, and zero proxy env usage."""
+    cur_url = (url or '').strip()
+    seen_hops: set[str] = set()
+    hops: list[dict[str, Any]] = []
+    allowed_set = {h.lower().lstrip('.') for h in allowed_hosts} if allowed_hosts is not None else None
+    prev_scheme = ''
+    initial_is_loopback: bool | None = None
+
+    for hop_idx in range(max_redirects + 1):
+        try:
+            parsed = urlsplit(cur_url)
+        except ValueError as exc:
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': f'invalid URL: {exc}', 'hops': hops}
+
+        scheme = parsed.scheme.lower()
+        host_raw = parsed.hostname or ''
+        kind, clean_host, ip_obj, host_err = _classify_host_strict(host_raw)
+        if kind == 'invalid':
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': host_err or 'invalid host', 'hops': hops}
+
+        if initial_is_loopback is None:
+            initial_is_loopback = _is_explicit_loopback_target(kind, clean_host, ip_obj)
+
+        # Prevent a public initial URL from ever redirecting to loopback even in fixture test mode
+        hop_allow_loopback = bool(allow_local_fixture and initial_is_loopback and _is_explicit_loopback_target(kind, clean_host, ip_obj))
+        ok_url, url_err = is_safe_public_url(cur_url, allow_private_fixture=hop_allow_loopback, resolve_dns=False)
+        if not ok_url:
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': url_err, 'hops': hops}
+
+        if prev_scheme == 'https' and scheme == 'http':
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': 'HTTPS downgraded to HTTP on redirect', 'hops': hops}
+        prev_scheme = scheme
+
+        if allowed_set is not None and not any(clean_host == a or clean_host.endswith('.' + a) for a in allowed_set):
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': f'host {clean_host!r} outside allowed domain scope', 'hops': hops}
+
+        port = parsed.port or (443 if scheme == 'https' else 80)
+        norm_hop = urlunsplit((scheme, parsed.netloc, parsed.path or '/', parsed.query, ''))
+        if norm_hop in seen_hops:
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': f'redirect loop detected at {norm_hop}', 'hops': hops}
+        seen_hops.add(norm_hop)
+
+        ok_dns, validated_ips, dns_err = resolve_and_validate_host(
+            clean_host, port, allow_loopback_fixture=hop_allow_loopback, resolver=resolver,
+        )
+        if not ok_dns or not validated_ips:
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': dns_err, 'hops': hops}
+
+        pinned_ip = validated_ips[0]
+        hops.append({'hop': hop_idx, 'url': norm_hop, 'host': clean_host, 'pinned_ip': pinned_ip, 'validated_ips': validated_ips})
+
+        path_and_query = parsed.path or '/'
+        if parsed.query:
+            path_and_query += f'?{parsed.query}'
+
+        req_headers = {
+            'Host': parsed.netloc,
+            'User-Agent': 'nox-extension-developer/2.1.1',
+            'Accept-Encoding': 'identity',
+            'Connection': 'close',
+            **(headers or {}),
+        }
+
+        conn = None
+        try:
+            if _connection_factory is not None:
+                conn = _connection_factory(scheme, pinned_ip, clean_host, port, float(timeout), ssl_context)
+            elif scheme == 'https':
+                conn = _PinnedHTTPSConnection(pinned_ip, clean_host, port, timeout=float(timeout), context=ssl_context)
+            else:
+                conn = _PinnedHTTPConnection(pinned_ip, clean_host, port, timeout=float(timeout))
+
+            conn.request('GET', path_and_query, headers=req_headers)
+            resp = conn.getresponse()
+            st = int(resp.status)
+            ctype = resp.getheader('Content-Type') or ''
+            loc = resp.getheader('Location')
+            if st in {301, 302, 303, 307, 308} and loc:
+                resp.read(64_000)
+                if hop_idx >= max_redirects:
+                    return {'status': st, 'content_type': ctype, 'body': b'', 'error': f'too many redirects (>{max_redirects})', 'hops': hops}
+                loc_clean = loc.strip()
+                if loc_clean.lower().startswith(('javascript:', 'data:', 'vbscript:', 'file:')):
+                    return {'status': 0, 'content_type': '', 'body': b'', 'error': f'dangerous redirect scheme: {loc_clean}', 'hops': hops}
+                cur_url = urljoin(norm_hop, loc_clean)
+                continue
+
+            raw_body = resp.read(max_bytes + 1)
+            if len(raw_body) > max_bytes:
+                return {'status': st, 'content_type': ctype, 'body': b'', 'error': f'response exceeds max_bytes={max_bytes}', 'hops': hops}
+            return {
+                'status': st,
+                'content_type': ctype,
+                'body': raw_body,
+                'error': None if 200 <= st < 400 else f'HTTP {st}',
+                'final_url': norm_hop,
+                'pinned_ip': pinned_ip,
+                'hops': hops,
+            }
+        except (http.client.HTTPException, ssl.SSLError, OSError, TimeoutError, ValueError) as exc:
+            return {'status': 0, 'content_type': '', 'body': b'', 'error': str(exc), 'hops': hops}
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    return {'status': 0, 'content_type': '', 'body': b'', 'error': f'too many redirects (>{max_redirects})', 'hops': hops}
+
+
+def safe_http_fetch(
+    url: str,
+    *,
+    allow_local_fixture: bool = False,
+    timeout: int = 8,
+    headers: dict[str, str] | None = None,
+    max_redirects: int = 5,
+    max_bytes: int = 2_000_000,
+    allowed_hosts: Iterable[str] | None = None,
+    resolver: Callable[[str, int], Sequence[str]] | None = None,
+) -> tuple[int, str, bytes, str | None]:
+    """Tuple-returning wrapper over safe_http_fetch_detailed for compatibility with scaffold/prober callers."""
+    res = safe_http_fetch_detailed(
+        url,
+        allow_local_fixture=allow_local_fixture,
+        timeout=timeout,
+        headers=headers,
+        max_redirects=max_redirects,
+        max_bytes=max_bytes,
+        allowed_hosts=allowed_hosts,
+        resolver=resolver,
+    )
+    return int(res['status']), str(res['content_type']), bytes(res['body']), res.get('error')
 
 
 def strip_tracking_params(query: str) -> str:

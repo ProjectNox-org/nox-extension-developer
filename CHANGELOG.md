@@ -1,5 +1,16 @@
 # Changelog
 
+## 2.1.1
+
+Security containment patch:
+
+- **Fail-closed Bubblewrap isolation for LNReader TypeScript execution (`scripts/nox_scaffold.py`, `scripts/nox_android.py`):**
+  - Executed `_execute_lnreader_ts_in_node` strictly inside Bubblewrap (`--unshare-all`, `--unshare-net`, `--clearenv`, read-only staged `/work`, ephemeral `--tmpfs /tmp`, zero host `$HOME` or credential mounts) and routed `@libs/fetch` requests over an authenticated per-run stdin/stdout host bridge constrained to the target origin and SSRF policy.
+  - Propagated `sandbox_available_override` through `execute_extension_behavior`, `auto_create_extension`, and `auto_fix_extension`, failing closed (`status='BLOCKED'`, `executed=False`, `executed_unprotected=False`) with a clear beginner explanation when `bwrap` isolation is unavailable (zero host fallback).
+- **Root-cause SSRF & DNS-rebinding hardening (`scripts/nox_core.py`, `scripts/nox_scaffold.py`, `scripts/nox_issues.py`, `scripts/references.py`):**
+  - Replaced unpinned `urllib.request.urlopen` calls with `safe_http_fetch_detailed` / `safe_http_fetch` across runtime probers, GitHub issue queries, and reference sync helpers.
+  - Enforced strict canonical host/IP validation (blocking octal/hex/integer/shorthand IPv4 forms, zone IDs, trailing-dot IPs, backslashes in authority, embedded IPv4-in-IPv6 forms such as IPv4-mapped/NAT64/6to4/Teredo, CGNAT, and `0.0.0.0/8`), single DNS resolution validating all returned addresses, pinned-IP HTTP/HTTPS socket connections with preserved TLS certificate + SNI hostname verification, hop-by-hop redirect validation (blocking HTTPS->HTTP downgrades and public->loopback redirects), proxy-environment bypass, and loopback-only local fixture scope.
+
 ## 2.1.0
 
 Security hardening, automated beginner workflows, and Issue #10 CLI fix:

@@ -744,6 +744,7 @@ def build_bwrap_invocation(
     allow_network: bool = False,
     bwrap_bin: str | None = None,
     extra_ro_binds: Sequence[tuple[str, str]] | None = None,
+    ro_work: bool = False,
 ) -> list[str]:
     """Construct a fail-closed Bubblewrap invocation isolating namespaces, environment, and $HOME."""
     bwrap = bwrap_bin or shutil.which('bwrap') or 'bwrap'
@@ -813,11 +814,13 @@ def build_bwrap_invocation(
         gd_norm = Path(guest_dst).as_posix()
         if hs.exists() and gd_norm.startswith('/sandbox-sdk/') and '..' not in Path(gd_norm).parts:
             cmd.extend(['--ro-bind', str(hs), gd_norm])
+            if gd_norm == '/sandbox-sdk/node':
+                path_parts.append('/sandbox-sdk/node/bin')
 
     path_parts.extend(['/usr/local/sbin', '/usr/local/bin', '/usr/bin', '/bin'])
     cmd.extend([
         '--setenv', 'PATH', ':'.join(path_parts),
-        '--setenv', 'HOME', '/work/.nox-sandbox-home',
+        '--setenv', 'HOME', '/tmp' if ro_work else '/work/.nox-sandbox-home',
         '--setenv', 'GRADLE_USER_HOME', '/work/.gradle-home',
         '--setenv', 'TMPDIR', '/tmp',
         '--setenv', 'LANG', 'C.UTF-8',
@@ -825,7 +828,7 @@ def build_bwrap_invocation(
         '--proc', '/proc',
         '--dev', '/dev',
         '--tmpfs', '/tmp',
-        '--bind', str(work), '/work',
+        '--ro-bind' if ro_work else '--bind', str(work), '/work',
         '--chdir', '/work',
         '--',
         *command,

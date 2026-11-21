@@ -22,7 +22,7 @@ FILES = (
     'references/api-contracts.md', 'references/catalog-1000.json', 'references/matrix-1000.json',
     'tests/test_api_compare.py', 'tests/test_install.py', 'tests/test_package.py', 'tests/test_references.py',
     'tests/test_nox_core_and_env.py', 'tests/test_nox_lab.py', 'tests/test_nox_android_and_issues.py', 'tests/test_nox_cli_and_matrix.py',
-    'tests/test_nox_scaffold.py', 'tests/test_nox_enhancements.py',
+    'tests/test_nox_scaffold.py', 'tests/test_nox_enhancements.py', 'tests/test_nox_security_v211.py',
 )
 
 

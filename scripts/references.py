@@ -11,10 +11,16 @@ from pathlib import Path
 import re
 import signal
 import subprocess
+import sys
 import tempfile
-import urllib.error
-import urllib.request
+from urllib.parse import urlsplit
 import uuid
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.insert(0, _SCRIPTS_DIR)
+
+from nox_core import safe_http_fetch_detailed  # noqa: E402
 
 SOURCES = {
     'keiyoushi': ('keiyoushi/extensions-source', ['AGENTS.md', 'CONTRIBUTING.md']),
@@ -25,9 +31,19 @@ MAX_BYTES = 4_000_000
 
 
 def get(url):
-    req = urllib.request.Request(url, headers={'User-Agent': 'nox-extension-developer/1', 'Accept': 'application/vnd.github+json'})
-    with urllib.request.urlopen(req, timeout=20) as response:
-        data = response.read(MAX_BYTES + 1)
+    parsed = urlsplit(str(url).strip())
+    if parsed.scheme.lower() != 'https':
+        raise ValueError(f'references.get requires https URL: {url}')
+    res = safe_http_fetch_detailed(
+        url,
+        allow_local_fixture=False,
+        timeout=20,
+        max_bytes=MAX_BYTES,
+        headers={'User-Agent': 'nox-extension-developer/1', 'Accept': 'application/vnd.github+json'},
+    )
+    if res.get('error') or int(res.get('status') or 0) >= 400:
+        raise OSError(res.get('error') or f"HTTP {res.get('status')}")
+    data = bytes(res['body'])
     if len(data) > MAX_BYTES:
         raise ValueError('response too large')
     return data
