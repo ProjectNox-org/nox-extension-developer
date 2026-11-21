@@ -69,7 +69,10 @@ def audit_untrusted_pr_or_repo(repo_path: Path | str) -> dict[str, Any]:
     # 2. Gradle files (configuration phase RCE risk!)
     for pattern in ('*.gradle', '*.gradle.kts'):
         for gf in root.rglob(pattern):
-            if any(part in {'.git', 'build', '.gradle', 'node_modules'} for part in gf.parts):
+            # Compare against the path *inside* the repository: the absolute prefix may
+            # legitimately contain "build" (e.g. /build/... in the Nix sandbox), which
+            # would otherwise skip every Gradle file being audited.
+            if any(part in {'.git', 'build', '.gradle', 'node_modules'} for part in gf.relative_to(root).parts):
                 continue
             txt = gf.read_text(errors='replace')
             for kind, rx in _GRADLE_EXEC_PATTERNS:
@@ -117,7 +120,7 @@ def audit_untrusted_pr_or_repo(repo_path: Path | str) -> dict[str, Any]:
     # 6. Source code checks (TLS bypass, DexClassLoader, command execution, bidi Trojan Source, secrets)
     for ext in ('*.kt', '*.java', '*.ts', '*.js', '*.py'):
         for sf in root.rglob(ext):
-            if any(part in {'.git', 'build', '.gradle', 'node_modules', '__pycache__', 'evidencias'} for part in sf.parts):
+            if any(part in {'.git', 'build', '.gradle', 'node_modules', '__pycache__', 'evidencias'} for part in sf.relative_to(root).parts):
                 continue
             rel = str(sf.relative_to(root))
             # Skip self-testing files that intentionally contain negative regexes/fixtures
@@ -737,6 +740,35 @@ def verify_gradle_execution_chain(repo_root: Path | str) -> dict[str, Any]:
     }
 
 
+def _nix_profile_bin_dirs() -> list[Path]:
+    """Perfis de sistema do Nix usados como PATH dentro da sandbox.
+
+    O perfil do usuário (`$HOME/.nix-profile`) é intencionalmente excluído: montá-lo
+    recriaria `/home/<user>` dentro do sandbox e quebraria o isolamento de `$HOME`.
+    """
+    candidates = [
+        Path('/run/current-system/sw/bin'),
+        Path('/nix/var/nix/profiles/default/bin'),
+    ]
+    return [c for c in candidates if c.is_dir()]
+
+
+def _bwrap_system_bind_args() -> list[str]:
+    """Monta (somente leitura) as raízes do sistema necessárias para executar o toolchain.
+
+    No NixOS todo binário vive no `/nix/store` imutável e legível por todos; sem esse
+    bind o sandbox não consegue nem executar `/bin/sh` (que é um symlink para o store).
+    """
+    args: list[str] = []
+    for sys_path in ('/nix/store', '/usr', '/bin', '/sbin', '/lib', '/lib64'):
+        sp = Path(sys_path)
+        if sp.is_symlink():
+            args.extend(['--symlink', os.readlink(sp), sys_path])
+        elif sp.is_dir():
+            args.extend(['--ro-bind', sys_path, sys_path])
+    return args
+
+
 def build_bwrap_invocation(
     work_dir: Path | str,
     command: Sequence[str],
@@ -758,12 +790,11 @@ def build_bwrap_invocation(
     ]
     cmd.append('--share-net' if allow_network else '--unshare-net')
 
-    for sys_path in ('/usr', '/bin', '/sbin', '/lib', '/lib64'):
-        sp = Path(sys_path)
-        if sp.is_symlink():
-            cmd.extend(['--symlink', os.readlink(sp), sys_path])
-        elif sp.is_dir():
-            cmd.extend(['--ro-bind', sys_path, sys_path])
+    cmd.extend(_bwrap_system_bind_args())
+
+    nix_bin_dirs = _nix_profile_bin_dirs()
+    for nix_bin in nix_bin_dirs:
+        cmd.extend(['--ro-bind', str(nix_bin), str(nix_bin)])
 
     etc_entries: list[Path] = [
         Path('/etc/alternatives'),
@@ -818,6 +849,7 @@ def build_bwrap_invocation(
                 path_parts.append('/sandbox-sdk/node/bin')
 
     path_parts.extend(['/usr/local/sbin', '/usr/local/bin', '/usr/bin', '/bin'])
+    path_parts.extend(str(d) for d in nix_bin_dirs)
     cmd.extend([
         '--setenv', 'PATH', ':'.join(path_parts),
         '--setenv', 'HOME', '/tmp' if ro_work else '/work/.nox-sandbox-home',
@@ -861,13 +893,8 @@ def probe_bwrap_sandbox(*, sandbox_available_override: bool | None = None) -> di
         '--new-session',
         '--clearenv',
     ]
-    for sys_path in ('/usr', '/bin', '/lib', '/lib64'):
-        sp = Path(sys_path)
-        if sp.is_symlink():
-            probe_cmd.extend(['--symlink', os.readlink(sp), sys_path])
-        elif sp.is_dir():
-            probe_cmd.extend(['--ro-bind', sys_path, sys_path])
-    probe_cmd.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--', '/usr/bin/env', 'true'])
+    probe_cmd.extend(_bwrap_system_bind_args())
+    probe_cmd.extend(['--proc', '/proc', '--dev', '/dev', '--tmpfs', '/tmp', '--', '/bin/sh', '-c', 'true'])
     try:
         proc = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=10, env={'PATH': '/usr/bin:/bin'})
     except Exception as exc:

@@ -52,6 +52,36 @@ class AndroidAndSecurityTests(unittest.TestCase):
             self.assertIn('trojan_source_bidi_control', kinds)
             self.assertIn('hardcoded_secret_candidate', kinds)
 
+    def test_security_audit_scans_repos_living_under_build_directory(self):
+        # Nix builds place sources under /build/..., which must not make the audit skip files.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / 'build' / 'repo'
+            (repo / 'src').mkdir(parents=True)
+            (repo / 'build.gradle.kts').write_text('Runtime.getRuntime().exec("id")')
+            (repo / 'src/Evil.kt').write_text('class Evil { val l = DexClassLoader("/tmp/x.dex", null, null, null) }')
+
+            audit = nox_android.audit_untrusted_pr_or_repo(repo)
+            self.assertEqual(audit['status'], 'FAIL')
+            files = {f['file'] for f in audit['findings']}
+            self.assertIn('build.gradle.kts', files)
+            self.assertIn('src/Evil.kt', files)
+
+    def test_bwrap_invocation_binds_system_roots_including_nix_store(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cmd = nox_android.build_bwrap_invocation(tmp, ['echo', 'ok'])
+            joined = ' '.join(cmd)
+            # /bin é diretório no NixOS e symlink para usr/bin no Ubuntu; ambos precisam
+            # aparecer no sandbox (como bind ou symlink), senão /bin/sh não resolve.
+            bin_path = Path('/bin')
+            if bin_path.is_symlink():
+                self.assertIn(f'--symlink {os.readlink(bin_path)} /bin', joined)
+            else:
+                self.assertIn('--ro-bind /bin /bin', joined)
+            if Path('/nix/store').is_dir():
+                self.assertIn('--ro-bind /nix/store /nix/store', joined)
+            self.assertEqual(cmd[-2:], ['echo', 'ok'])
+            self.assertIn('--unshare-net', cmd)
+
     def test_apk_inspect_synthetic_missing_and_real_local_if_present(self):
         missing = nox_android.inspect_apk('/nonexistent/missing.apk')
         self.assertEqual(missing['status'], 'FAIL')

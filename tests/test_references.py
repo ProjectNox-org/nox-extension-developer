@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -207,7 +208,7 @@ class Snapshots(unittest.TestCase):
 
     def test_git_timeout_terminates_its_child_process_group(self):
         git = self.root / 'git'
-        git.write_text('#!/usr/bin/python3\nimport subprocess, time\nsubprocess.Popen(["/usr/bin/python3", "-c", "import time; time.sleep(30)"])\ntime.sleep(30)\n')
+        git.write_text(f'#!{sys.executable}\nimport subprocess, time\nsubprocess.Popen([{sys.executable!r}, "-c", "import time; time.sleep(30)"])\ntime.sleep(30)\n')
         git.chmod(0o755)
         start = time.monotonic()
         with patch.dict(os.environ, {'PATH': str(self.root)}):
