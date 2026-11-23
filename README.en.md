@@ -199,10 +199,10 @@ Full operating-system instructions (**Windows via WSL**, **Arch Linux**, **Ubunt
 
 | Agent | Status |
 |---|---|
-| [OpenCode](https://opencode.ai/) | ✅ Tested (`v2.2.7` on Arch Linux) |
+| [OpenCode](https://opencode.ai/) | ✅ Tested |
 | [Codex](https://developers.openai.com/codex/) | 🟡 Documented (execution not tested) |
 | [Claude Code](https://code.claude.com/) | 🟡 Documented (execution not tested) |
-| [Google Antigravity](https://antigravity.google/) | 🟡 Documented (not verified) |
+| [Google Antigravity](https://antigravity.google/) | ✅ Tested |
 | [Hermes Agent](https://github.com/NousResearch/hermes-agent) | ⚪ Not verified |
 
 `Codex` (`~/.agents/skills/`), `Claude Code` (`~/.claude/skills/`), and `Google Antigravity` (`~/.gemini/antigravity/skills/`) have documented targets prepared in [`scripts/install.py`](scripts/install.py), without local symlink or execution tests; `Hermes Agent` has no dedicated installer target. Official tests ran on **Arch Linux** (other Linux distros, macOS, and Windows via WSL have not been verified). See [`COMPATIBILIDADE.md`](COMPATIBILIDADE.md).
