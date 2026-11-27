@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'scripts'))
@@ -18,6 +19,11 @@ import nox
 import nox_android
 import nox_env
 import nox_scaffold
+
+
+def _has_lnreader_sandbox() -> bool:
+    """Return True when both Bubblewrap userns sandbox and Node.js runtime are usable."""
+    return nox_android.probe_bwrap_sandbox()['status'] == 'PASS' and bool(shutil.which('node'))
 
 
 _HAS_ANDROID_COMPILE_SANDBOX = (
@@ -149,6 +155,31 @@ class FullAutomationEndToEndTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
+    def _assert_lnreader_behavior_blocked(self, res: dict) -> None:
+        """Assert fail-closed LNReader behavior block with zero host fallback."""
+        self.assertEqual(res['status'], 'BLOCKED')
+        self.assertIs(res['executed'], False)
+        self.assertIs(res['executed_unprotected'], False)
+
+    def _assert_lnreader_create_blocked(self, res: dict) -> None:
+        """Assert fail-closed LNReader auto_create_extension result when sandbox is unavailable."""
+        self.assertEqual(res['status'], 'BLOCKED')
+        self.assertFalse(res['code_implemented'])
+        self.assertFalse(res['tests_verified'])
+        self.assertEqual(res['execution_stages']['extension_functions_tested'], 'BLOCKED')
+        self.assertFalse(res['agent_continuation']['task_complete'])
+
+    def _assert_lnreader_fix_blocked(self, res: dict) -> None:
+        """Assert fail-closed LNReader auto_fix_extension result with preserved safe source fixes."""
+        self.assertEqual(res['status'], 'BLOCKED')
+        self.assertTrue(res['code_modified'])
+        self.assertFalse(res['tests_verified'])
+        self.assertEqual(res['before_verification']['behavior']['status'], 'BLOCKED')
+        self.assertIs(res['before_verification']['behavior']['executed_unprotected'], False)
+        self.assertEqual(res['after_verification']['status'], 'BLOCKED')
+        self.assertIs(res['after_verification']['behavior']['executed_unprotected'], False)
+        self.assertFalse(res['agent_continuation']['task_complete'])
+
     def test_A_B_C_D_G_I_real_create_fix_across_three_ecosystems_and_beginner_ux(self):
         with tempfile.TemporaryDirectory() as tmp:
             tp = Path(tmp)
@@ -245,7 +276,8 @@ class FullAutomationEndToEndTests(unittest.TestCase):
             self.assertTrue(fix_c['code_modified'])
             self.assertIn('a.episode[href]', kt_c.read_text(encoding='utf-8'))
 
-            # TEST D: LNReader novel creation & repair
+            # TEST D: LNReader novel creation & repair (PASS when sandboxed, BLOCKED fail-closed when bwrap unavailable)
+            lnreader_sandbox_ok = _has_lnreader_sandbox()
             out_d = tp / 'novel_out'
             res_d = nox_scaffold.auto_create_extension(
                 f'Crie um plugin de novel para {self.base_url}',
@@ -253,11 +285,20 @@ class FullAutomationEndToEndTests(unittest.TestCase):
                 allow_local_fixture=True,
                 output_dir=out_d,
             )
-            self.assertEqual(res_d['status'], 'PASS')
             self.assertEqual(res_d['ecosystem'], 'lnreader')
-            self.assertTrue(res_d['code_implemented'])
-            self.assertTrue(res_d['tests_verified'])
+            self.assertEqual(res_d['execution_stages']['site_analyzed'], 'PASS')
+            self.assertEqual(res_d['execution_stages']['code_generated'], 'PASS')
+            self.assertEqual(res_d['execution_stages']['code_validated_statically'], 'PASS')
             ts_d = Path(res_d['persisted_files'][0])
+            self.assertTrue(ts_d.is_file())
+            if lnreader_sandbox_ok:
+                self.assertEqual(res_d['status'], 'PASS')
+                self.assertTrue(res_d['code_implemented'])
+                self.assertTrue(res_d['tests_verified'])
+                self.assertEqual(res_d['execution_stages']['extension_functions_tested'], 'PASS')
+            else:
+                self._assert_lnreader_create_blocked(res_d)
+
             ts_d.write_text(
                 ts_d.read_text(encoding='utf-8')
                 .replace('.chapter-content', '.broken-content')
@@ -265,11 +306,16 @@ class FullAutomationEndToEndTests(unittest.TestCase):
                 encoding='utf-8',
             )
             fix_d = nox_scaffold.auto_fix_extension(out_d, 'capitulo vazio', ecosystem='lnreader', allow_local_fixture=True, technical=True)
-            self.assertEqual(fix_d['status'], 'PASS')
             self.assertTrue(fix_d['code_modified'])
             fixed_d_text = ts_d.read_text(encoding='utf-8')
             self.assertIn('.chapter-content', fixed_d_text)
             self.assertIn("remove()", fixed_d_text)
+            if lnreader_sandbox_ok:
+                self.assertEqual(fix_d['status'], 'PASS')
+                self.assertTrue(fix_d['tests_verified'])
+                self.assertEqual(fix_d['after_verification']['status'], 'PASS')
+            else:
+                self._assert_lnreader_fix_blocked(fix_d)
 
             # TEST G: Blocked/failed build preserves source code, never offers fake APK or install menu
             blocked_repo = tp / 'blocked_gradle'
@@ -415,7 +461,7 @@ class FullAutomationEndToEndTests(unittest.TestCase):
             self.assertEqual(sc_yuz['package_name'], 'eu.kanade.tachiyomi.animeextension.pt.animebr')
             self.assertEqual(sc_yuz['source_id'], nox_env.compute_source_id('AnimeBR', 'pt-BR', 1))
 
-            # Test 4: LNReader real Node.js execution fails cleanly on broken selector, passes when intact
+            # Test 4: LNReader real Node.js execution fails cleanly on broken selector, passes when intact (or blocks fail-closed without bwrap)
             lnr_dir = tp / 'pt_lnr'
             sc_lnr = nox_scaffold.scaffold_extension(
                 'lnreader', 'NovelBrasil', self.base_url, lang='pt-BR', output_dir=lnr_dir,
@@ -424,12 +470,16 @@ class FullAutomationEndToEndTests(unittest.TestCase):
             self.assertIn('/plugins/portuguese/', sc_lnr['module_path'])
             ts_file = Path(sc_lnr['module_path'])
             exec_ok = nox_scaffold.execute_extension_behavior('lnreader', [ts_file], self.base_url, allow_local_fixture=True)
-            self.assertEqual(exec_ok['status'], 'PASS')
-            self.assertEqual(exec_ok['engine'], 'node')
             saved_ts = ts_file.read_text(encoding='utf-8')
             ts_file.write_text(saved_ts.replace('.chapter-content', '.selector-inexistente'), encoding='utf-8')
             exec_fail = nox_scaffold.execute_extension_behavior('lnreader', [ts_file], self.base_url, allow_local_fixture=True)
-            self.assertEqual(exec_fail['status'], 'FAIL')
+            if _has_lnreader_sandbox():
+                self.assertEqual(exec_ok['status'], 'PASS')
+                self.assertEqual(exec_ok['engine'], 'node')
+                self.assertEqual(exec_fail['status'], 'FAIL')
+            else:
+                self._assert_lnreader_behavior_blocked(exec_ok)
+                self._assert_lnreader_behavior_blocked(exec_fail)
 
             # Test 5: Negative check — invalid Kotlin syntax or hyphenated pt-BR package MUST FAIL compilation & validation
             bad_mod = tp / 'bad_kt'
@@ -492,6 +542,73 @@ class FullAutomationEndToEndTests(unittest.TestCase):
             self.assertEqual(fix_cust['status'], 'INCONCLUSIVE')
             self.assertIsNotNone(fix_cust.get('agent_solver'))
             self.assertTrue(fix_cust['agent_continuation']['must_continue_automatically'])
+
+    def test_lnreader_fail_closed_under_simulated_bwrap_unavailability(self):
+        """Controlled simulation: without bwrap, LNReader create/fix/execute all return BLOCKED with zero host execution."""
+        real_which = shutil.which
+
+        def _which_without_bwrap(cmd, mode=os.F_OK | os.X_OK, path=None):
+            if cmd == 'bwrap':
+                return None
+            return real_which(cmd, mode=mode, path=path)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tp = Path(tmp)
+            host_marker = tp / 'host_exec_marker.txt'
+            rogue_ts = tp / 'rogue_plugin.ts'
+            rogue_ts.write_text(
+                "import fs from 'node:fs';\n"
+                f'fs.writeFileSync({str(host_marker)!r}, "UNPROTECTED_HOST_EXECUTION");\n'
+                'export default {\n'
+                '  async popularNovels() { return []; },\n'
+                '  async searchNovels() { return []; },\n'
+                '  async parseNovel() { return { chapters: [] }; },\n'
+                '  async parseChapter() { return ""; },\n'
+                '};\n',
+                encoding='utf-8',
+            )
+
+            with mock.patch('nox_android.shutil.which', side_effect=_which_without_bwrap):
+                self.assertFalse(_has_lnreader_sandbox())
+
+                exec_blocked = nox_scaffold.execute_extension_behavior(
+                    'lnreader',
+                    [rogue_ts],
+                    self.base_url,
+                    allow_local_fixture=True,
+                )
+                self._assert_lnreader_behavior_blocked(exec_blocked)
+                self.assertIn('bubblewrap_sandbox_unavailable', exec_blocked.get('failures', []))
+                self.assertFalse(host_marker.exists())
+
+                out_sim = tp / 'sim_novel_out'
+                created_blocked = nox_scaffold.auto_create_extension(
+                    f'Crie um plugin de novel para {self.base_url}',
+                    ecosystem='lnreader',
+                    allow_local_fixture=True,
+                    output_dir=out_sim,
+                )
+                self._assert_lnreader_create_blocked(created_blocked)
+                sim_ts = Path(created_blocked['persisted_files'][0])
+                self.assertTrue(sim_ts.is_file())
+
+                sim_ts.write_text(
+                    sim_ts.read_text(encoding='utf-8')
+                    .replace('.chapter-content', '.broken-content')
+                    .replace("    $('script, style, nav').remove();\n", ''),
+                    encoding='utf-8',
+                )
+                fixed_blocked = nox_scaffold.auto_fix_extension(
+                    out_sim,
+                    'capitulo vazio',
+                    ecosystem='lnreader',
+                    allow_local_fixture=True,
+                    technical=True,
+                )
+                self._assert_lnreader_fix_blocked(fixed_blocked)
+                self.assertIn('.chapter-content', sim_ts.read_text(encoding='utf-8'))
+                self.assertIn('remove()', sim_ts.read_text(encoding='utf-8'))
+                self.assertFalse(host_marker.exists())
 
 
 if __name__ == '__main__':
